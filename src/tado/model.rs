@@ -5,6 +5,7 @@ pub struct AuthStartResponse {
     pub device_code: String,
     pub expires_in: u64,
     pub interval: u64,
+    pub user_code: String,
     pub verification_uri_complete: String,
 }
 

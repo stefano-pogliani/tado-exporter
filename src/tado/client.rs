@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
 
@@ -14,7 +15,8 @@ use super::model::{
 const AUTH_PENDING_MESSAGE: &str = "authorization_pending";
 
 lazy_static! {
-    // TODO: POST DEVICE - https://login.tado.com/oauth2/device
+    static ref AUTH_COMPLETE_URL: reqwest::Url = "https://login.tado.com/oauth2/authorize".parse().unwrap();
+    static ref AUTH_DEVICE_URL: reqwest::Url = "https://login.tado.com/oauth2/device".parse().unwrap();
     static ref AUTH_START_URL: reqwest::Url = "https://login.tado.com/oauth2/device_authorize".parse().unwrap();
     static ref AUTH_TOKEN_URL: reqwest::Url = "https://login.tado.com/oauth2/token".parse().unwrap();
     pub static ref BASE_URL: reqwest::Url = "https://my.tado.com/api/v2/".parse().unwrap();
@@ -35,7 +37,11 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(username: String, password: String, client_id: String) -> Client {
+    pub fn new(
+        username: String,
+        password: String,
+        client_id: String,
+    ) -> Client {
         Client::with_base_url(BASE_URL.clone(), username, password, client_id)
     }
 
@@ -61,6 +67,103 @@ impl Client {
         }
     }
 
+    /// Simulate the user side of device flow to approve an authentication request.
+    async fn approve_device(&self, start: &AuthStartResponse) -> Result<(), AuthError> {
+        let http_client_without_redirect = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+
+        // Start the login session to obtain needed values.
+        let device_params = [
+            ("client_id", self.client_id.as_ref()),
+            ("tenantId", "1d543ad5-a8ac-4704-b9e2-26838b4d6513"),
+            ("user_code", start.user_code.as_ref()),
+            ("interactive_user_code", start.user_code.as_ref()),
+        ];
+        let resp = http_client_without_redirect
+            .post(AUTH_DEVICE_URL.clone())
+            .form(&device_params)
+            .send()
+            .await?;
+
+        // Grab needed values from POST redirect URL.
+        let location = match resp.headers().get(reqwest::header::LOCATION) {
+            Some(location) => location,
+            None => {
+                let error = AuthError::UnexpectedStatus(resp.status(), resp.url().clone());
+                return Err(error);
+            }
+        };
+        let location = location.to_str()?;
+        let mut auth_base = AUTH_DEVICE_URL.clone();
+        auth_base.set_path("");
+        let location = format!("{}{}", auth_base.as_str(), location);
+        let location = reqwest::Url::parse(&location)?;
+        let query: HashMap<_, _> = location.query_pairs().collect();
+        let code_challenge = query
+            .get("code_challenge")
+            .ok_or(AuthError::MissingParam("code_challenge"))?;
+        let code_challenge_method = query
+            .get("code_challenge_method")
+            .ok_or(AuthError::MissingParam("code_challenge_method"))?;
+        let redirect_uri = query
+            .get("redirect_uri")
+            .ok_or(AuthError::MissingParam("redirect_uri"))?;
+        let response_type = query
+            .get("response_type")
+            .ok_or(AuthError::MissingParam("response_type"))?;
+        let state = query
+            .get("state")
+            .ok_or(AuthError::MissingParam("state"))?;
+        let tenant_id = query
+            .get("tenantId")
+            .ok_or(AuthError::MissingParam("tenantId"))?;
+
+        // Post authentication data to complete the process.
+        let authorise_params = [
+            ("client_id", self.client_id.as_str()),
+            ("code_challenge", code_challenge),
+            ("code_challenge_method", code_challenge_method),
+            ("redirect_uri", redirect_uri),
+            ("response_type", response_type),
+            ("state", state),
+            ("tenantId", tenant_id),
+            ("user_code", start.user_code.as_str()),
+            ("loginId", self.username.as_str()),
+            ("password", self.password.as_str()),
+
+            // TODO: Empty values are still needed?
+            ("captcha_token", ""),
+            ("metaData.device.name", ""),
+            ("metaData.device.type", ""),
+            ("nonce", ""),
+            ("oauth_context", ""),
+            ("pendingIdPLinkId", ""),
+            ("response_mode", ""),
+            ("scope", ""),
+            ("timezone", ""),
+            ("userVerifyingPlatformAuthenticatorAvailable", "false"),
+        ];
+        let mut req = self
+            .http_client
+            .post(AUTH_COMPLETE_URL.clone())
+            .form(&authorise_params)
+            // TODO: Are referrer and cookies needed?
+            .header(reqwest::header::REFERER, "https://login.tado.com/");
+
+        // Carry over cookies so the session works.
+        for cookie in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+            req = req.header(reqwest::header::COOKIE, cookie);
+        }
+
+        let resp = req
+            .send()
+            .await?;
+        resp.error_for_status_ref()?;
+        let _body = resp.text().await?;
+        Ok(())
+    }
+
     /// Authenticate to the Tado API service.
     ///
     /// The authentication processes uses the oauth2 device code grant flow as required by Tado
@@ -83,7 +186,8 @@ impl Client {
         let start = resp.json::<AuthStartResponse>().await?;
         info!("Started device authentication flow with URL {}", start.verification_uri_complete);
 
-        // TODO: run through login flow.
+        // Approve the device authentication session to obtain the needed tokens.
+        self.approve_device(&start).await?;
 
         // Wait for API tokens to be returned once the flow is complete.
         self.wait_for_tokens(start).await?;
